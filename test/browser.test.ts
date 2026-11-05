@@ -78,3 +78,39 @@ test("a failed call does not jam the queue", async () => {
   await expect(queue.run("bad")).rejects.toThrow("boom");
   expect(await queue.run("good")).toBe("good");
 });
+
+/** Runs a generated script against a stand-in tab API, so the test exercises the script's own cleanup. */
+function browserFor(tabApi: { evaluate: () => Promise<unknown>; closeTab: () => Promise<void> }, onTabLeftOpen: () => void) {
+  const AsyncFunction = (async () => {}).constructor as new (...args: string[]) => (...args: unknown[]) => Promise<void>;
+  return createBrowser({
+    run: async (code) => {
+      const lines: string[] = [];
+      const tab = { evaluate: tabApi.evaluate };
+      await new AsyncFunction("openTab", "closeTab", "console", code)(async () => tab, tabApi.closeTab, { log: (line: string) => lines.push(line) });
+      return lines.join("\n");
+    },
+  }, onTabLeftOpen);
+}
+
+const page = { url: "https://a.example/", title: "t", text: "x" };
+
+test("a closed tab is not reported", async () => {
+  let reported = 0;
+  const browser = browserFor({ evaluate: async () => page, closeTab: async () => {} }, () => { reported += 1; });
+  expect(await browser.read(page.url)).toEqual(page);
+  expect(reported).toBe(0);
+});
+
+test("a tab that will not close is reported, and the page is still returned without the flag", async () => {
+  let reported = 0;
+  const browser = browserFor({ evaluate: async () => page, closeTab: async () => { throw new Error("no such tab"); } }, () => { reported += 1; });
+  expect(await browser.read(page.url)).toEqual(page);
+  expect(reported).toBe(1);
+});
+
+test("a read that fails and leaves its tab open reports both", async () => {
+  let reported = 0;
+  const browser = browserFor({ evaluate: async () => { throw new Error("page crashed"); }, closeTab: async () => { throw new Error("no such tab"); } }, () => { reported += 1; });
+  await expect(browser.read(page.url)).rejects.toThrow("page crashed");
+  expect(reported).toBe(1);
+});

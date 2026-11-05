@@ -73,6 +73,7 @@ function script(body: string, args: unknown, marker: string): string {
   const args = ${JSON.stringify(args)};
   const emit = (value) => console.log(${JSON.stringify(marker)} + JSON.stringify(value) + ${JSON.stringify(marker)});
   let tab;
+  let result;
   try {
     tab = await openTab(args.url);
     await tab.evaluate(async () => {
@@ -82,24 +83,26 @@ function script(body: string, args: unknown, marker: string): string {
     });
 ${body}
   } catch (error) {
-    emit({ error: String(error?.message ?? error).slice(0, 300) });
+    result = { error: String(error?.message ?? error).slice(0, 300) };
   } finally {
-    if (tab) await closeTab(tab).catch(() => {});
+    if (tab) await closeTab(tab).catch(() => { result = { ...result, tabLeftOpen: true }; });
+    emit(result);
   }
 })();`;
 }
 
-function parseMarked<T>(output: string, marker: string): T {
+function parseMarked<T>(output: string, marker: string, onTabLeftOpen: () => void): T {
   const start = output.indexOf(marker);
   const end = output.lastIndexOf(marker);
   if (start < 0 || end <= start) throw new Error("Aside returned no result");
-  const value = JSON.parse(output.slice(start + marker.length, end)) as T | { error: string };
-  if (value && typeof value === "object" && "error" in value) throw new Error(`could not read the page: ${value.error}`);
+  const { tabLeftOpen, ...value } = JSON.parse(output.slice(start + marker.length, end)) as { tabLeftOpen?: boolean; error?: string };
+  if (tabLeftOpen) onTabLeftOpen();
+  if (value.error !== undefined) throw new Error(`could not read the page: ${value.error}`);
   return value as T;
 }
 
 const READ_BODY = `    const read = await tab.evaluate(() => ({ url: location.href, title: document.title, text: document.body?.innerText ?? "" }));
-    emit(read);`;
+    result = read;`;
 
 // Result markup changes often, so each extractor is best-effort and `text` always carries the whole page.
 const SEARCH_BODY = `    const read = await tab.evaluate((engine) => {
@@ -121,7 +124,7 @@ const SEARCH_BODY = `    const read = await tab.evaluate((engine) => {
       }
       return { url: location.href, title: document.title, text: document.body?.innerText ?? "", hits: [...hits.values()] };
     }, args.engine);
-    emit(read);`;
+    result = read;`;
 
 export function searchUrl(engine: Engine, query: string): string {
   const encoded = encodeURIComponent(query);
@@ -133,10 +136,11 @@ export type Browser = {
   search(engine: Engine, query: string): Promise<RawSearch>;
 };
 
-export function createBrowser(repl: Repl): Browser {
+/** `onTabLeftOpen` runs when a page was read but its tab could not be closed, which the result alone would hide. */
+export function createBrowser(repl: Repl, onTabLeftOpen: () => void = () => {}): Browser {
   async function call<T>(body: string, args: unknown): Promise<T> {
     const marker = `@@${randomBytes(16).toString("hex")}@@`;
-    return parseMarked<T>(await repl.run(script(body, args, marker)), marker);
+    return parseMarked<T>(await repl.run(script(body, args, marker)), marker, onTabLeftOpen);
   }
   return {
     read: (url) => call<RawPage>(READ_BODY, { url }),
